@@ -1,0 +1,60 @@
+# Legrest Linkage Optimizer - PySide6 桌面原型源码包
+
+## 当前软件边界
+
+这是腿托连杆优化桌面原型版，固定为当前腿托连杆形式。
+
+已内置定量：连杆形式、固定点规则、输出连杆 F-G、输出点 F、默认 F-G 顺时针打开 75°、孔距 40mm、死点 15°、A 点为丝杆经过点、关闭状态 A 点后方丝杆长度 70mm。
+
+暂不做：Excel 导入导出、干涉检查、CATIA 接口、DXF 导出、多套连杆拓扑。
+
+## Windows 运行源码
+
+建议使用 Windows 10/11 + Python 3.11 或 3.12 64位。
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python main.py
+```
+
+## 打包成免安装 EXE
+
+推荐先用文件夹模式，Qt 程序更稳定。
+
+```bat
+.venv\Scripts\activate
+build_windows.bat
+```
+
+打包完成后运行：
+
+```text
+dist\LegrestOptimizer\LegrestOptimizer.exe
+```
+
+把整个 `dist\LegrestOptimizer` 文件夹发给别人即可。
+
+## 单文件 EXE
+
+```bat
+.venv\Scripts\activate
+build_windows_onefile.bat
+```
+
+输出：
+
+```text
+dist\LegrestOptimizer.exe
+```
+
+单文件版启动会慢一些，建议先用文件夹模式验证。
+
+## 常见问题
+
+1. 运行提示找不到 PySide6/numpy/scipy：确认已激活虚拟环境，并重新执行 `pip install -r requirements.txt`。
+2. EXE 打不开：优先使用文件夹模式，不要先用 onefile。
+3. 公司电脑不能装 Python：在另一台 Windows 电脑打包，把 `dist\LegrestOptimizer` 文件夹复制过去。
+4. 坐标要放到 Excel：点击“复制优化后坐标”，然后在 Excel 中粘贴。

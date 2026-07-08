@@ -1,0 +1,233 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
+import math
+import json
+import numpy as np
+from scipy.optimize import least_squares, differential_evolution
+
+POINTS = list('ABCDEFGHI')
+# A是丝杆经过点，不作为普通A-B连杆孔距检查对象。
+LINKS = [('B-C','B','C'),('C-D','C','D'),('D-E','D','E'),('E-F','E','F'),('F-G','F','G'),('G-D','G','D'),('D-I','D','I'),('H-I','H','I')]
+DRAW_LINKS = [('B','C'),('C','D'),('D','E'),('E','F'),('F','G'),('G','D'),('D','I'),('H','I'),('J','B')]
+DEAD = [('C-D-G@D','C','D','G'),('C-D-I@D','C','D','I'),('C-E-F@E','C','E','F'),('E-F-G@F','E','F','G'),('F-G-D@G','F','G','D'),('D-I-H@I','D','I','H')]
+
+@dataclass
+class PointRange:
+    enabled: bool = False
+    x_min: float = 0.0
+    x_max: float = 0.0
+    z_min: float = 0.0
+    z_max: float = 0.0
+
+@dataclass
+class Settings:
+    output_angle_deg: float = -75.0
+    rod_rear_length: float = 70.0
+    min_hole_distance: float = 40.0
+    min_dead_angle: float = 15.0
+    angle_steps: int = 25
+    maxiter: int = 18
+    popsize: int = 7
+    target_mode: str = 'length'  # length / height / combined
+    height_not_lower: bool = True
+    strict_dead_angle: bool = True
+
+@dataclass
+class LinkageCase:
+    points: Dict[str, np.ndarray]
+    ranges: Dict[str, PointRange]
+    settings: Settings
+
+    def variables(self) -> List[Tuple[str,str]]:
+        out = []
+        for p in POINTS:
+            r = self.ranges.get(p, PointRange())
+            if not r.enabled:
+                continue
+            if abs(r.x_max-r.x_min) > 1e-12:
+                out.append((p,'x'))
+            if abs(r.z_max-r.z_min) > 1e-12:
+                out.append((p,'z'))
+        return out
+
+    def bounds(self) -> List[Tuple[float,float]]:
+        out = []
+        for p,a in self.variables():
+            r = self.ranges[p]
+            out.append((r.x_min,r.x_max) if a=='x' else (r.z_min,r.z_max))
+        return out
+
+    def copy_points(self):
+        return {k: np.array(v,dtype=float).copy() for k,v in self.points.items()}
+
+    def apply(self, x) -> Dict[str,np.ndarray]:
+        pts = self.copy_points()
+        for val,(p,a) in zip(x,self.variables()):
+            pts[p][0 if a=='x' else 1] += float(val)
+        return pts
+
+def load_case(path: str) -> LinkageCase:
+    with open(path,'r',encoding='utf-8') as f:
+        data = json.load(f)
+    pts = {p: np.array(data['points'][p], dtype=float) for p in POINTS}
+    enabled = set(data.get('enabled_points', []))
+    ranges = {}
+    raw = data.get('ranges', {})
+    for p in POINTS:
+        r = raw.get(p,{})
+        ranges[p] = PointRange(p in enabled, float(r.get('x_min',0)), float(r.get('x_max',0)), float(r.get('z_min',0)), float(r.get('z_max',0)))
+    s = data.get('settings', {})
+    settings = Settings(
+        output_angle_deg=float(s.get('output_angle_deg',-75)), rod_rear_length=float(s.get('rod_rear_length',70)),
+        min_hole_distance=float(s.get('min_hole_distance',40)), min_dead_angle=float(s.get('min_dead_angle',15)),
+        angle_steps=int(s.get('angle_steps',25)), maxiter=int(s.get('maxiter',18)), popsize=int(s.get('popsize',7)),
+        target_mode=str(s.get('target_mode','length')), height_not_lower=bool(s.get('height_not_lower',True)),
+        strict_dead_angle=bool(s.get('strict_dead_angle',True)))
+    return LinkageCase(pts, ranges, settings)
+
+def rot(a: float) -> np.ndarray:
+    c,s = math.cos(a), math.sin(a)
+    return np.array([[c,-s],[s,c]], dtype=float)
+
+def dist(p,q) -> float:
+    return float(np.linalg.norm(p-q))
+
+def unit(v) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    return np.array([1.0,0.0]) if n < 1e-12 else v/n
+
+def angle_between(u,v) -> float:
+    nu,nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    if nu < 1e-12 or nv < 1e-12:
+        return 0.0
+    c = max(-1.0, min(1.0, float(np.dot(u,v)/(nu*nv))))
+    return math.degrees(math.acos(c))
+
+def link_lengths(pts):
+    return {name: dist(pts[a],pts[b]) for name,a,b in LINKS}
+
+def min_hole(pts):
+    vals = link_lengths(pts)
+    key = min(vals, key=lambda k: vals[k])
+    return vals[key], key
+
+def dead_angles(state):
+    vals = {}
+    for name,p1,pc,p2 in DEAD:
+        t = angle_between(state[p1]-state[pc], state[p2]-state[pc])
+        vals[name] = min(t,180-t)
+    return vals
+
+def min_dead(states):
+    mn,key,step = 999.0,'',0
+    for st in states:
+        for k,v in dead_angles(st).items():
+            if v < mn:
+                mn,key,step = v,k,int(st.get('step',0))
+    return mn,key,step
+
+def rod_state(A, B_closed, B_now, rear_closed):
+    # 关闭状态A点后方长度为rear_closed；运动中显示J-B总长保持不变，且J-A-B共线。
+    total_len = dist(A,B_closed) + max(0.0,float(rear_closed))
+    direction = unit(B_now-A)
+    J = B_now - total_len * direction
+    ab_now = dist(A,B_now)
+    rear_now = total_len - ab_now
+    return J, ab_now, rear_now, total_len
+
+def solve_path(pts: Dict[str,np.ndarray], settings: Settings, steps: Optional[int]=None):
+    n = max(3, int(settings.angle_steps if steps is None else steps))
+    C,H,A = pts['C'], pts['H'], pts['A']
+    B0,D0,E0,F0,G0,I0 = pts['B'],pts['D'],pts['E'],pts['F'],pts['G'],pts['I']
+    L_EF, L_HI = dist(E0,F0), dist(H,I0)
+    vB,vD,vE = B0-C, D0-C, E0-C
+    vG,vI,vFG = G0-D0, I0-D0, F0-G0
+    states = []
+    prev = np.array([0.0,0.0])
+    max_err = 0.0
+    for k in range(n+1):
+        phi = math.radians(settings.output_angle_deg*k/n)
+        def residual(x):
+            alpha,beta = x
+            R1,R4 = rot(alpha),rot(beta)
+            D = C + R1.dot(vD)
+            E = C + R1.dot(vE)
+            G = D + R4.dot(vG)
+            I = D + R4.dot(vI)
+            F = G + rot(phi).dot(vFG)
+            return np.array([np.linalg.norm(I-H)-L_HI, np.linalg.norm(F-E)-L_EF], dtype=float)
+        guesses = [prev, prev+[.03,.03], prev+[-.03,-.03], prev+[.03,-.03], prev+[-.03,.03], np.array([0,0]), np.array([.5,0]), np.array([-.5,0]), np.array([0,.5]), np.array([0,-.5])]
+        cand = []
+        for g in guesses:
+            res = least_squares(residual, g, max_nfev=120, xtol=1e-9, ftol=1e-9, gtol=1e-9)
+            err = float(np.linalg.norm(residual(res.x)))
+            if err < 1e-4:
+                cand.append((float(np.linalg.norm(res.x-prev)), err, res.x))
+        if not cand:
+            return None, False, f'运动学求解失败：step={k}'
+        _,err,x = sorted(cand, key=lambda c:(c[0],c[1]))[0]
+        prev = x
+        max_err = max(max_err,err)
+        alpha,beta = x
+        R1,R4 = rot(alpha),rot(beta)
+        B = C + R1.dot(vB)
+        D = C + R1.dot(vD)
+        E = C + R1.dot(vE)
+        G = D + R4.dot(vG)
+        I = D + R4.dot(vI)
+        F = G + rot(phi).dot(vFG)
+        J,ab,rear,total = rod_state(A,B0,B,settings.rod_rear_length)
+        states.append({'step':k,'angle_deg':settings.output_angle_deg*k/n,'A':A.copy(),'B':B,'C':C.copy(),'D':D,'E':E,'F':F,'G':G,'H':H.copy(),'I':I,'J':J,'AB_len':ab,'rod_rear_len':rear,'rod_total_len':total,'solve_residual':err})
+    return states, True, f'max residual={max_err:.6g}'
+
+def evaluate(pts: Dict[str,np.ndarray], settings: Settings, base_open_z=None):
+    states,ok,msg = solve_path(pts,settings)
+    if not ok:
+        return {'ok':False,'message':msg}
+    f0,fo = pts['F'], states[-1]['F']
+    h,hk = min_hole(pts)
+    da,dk,ds = min_dead(states)
+    return {'ok':True,'message':msg,'states':states,'dx':float(fo[0]-f0[0]),'dz':float(fo[1]-f0[1]),'f_open':fo,
+            'min_hole':h,'min_hole_key':hk,'min_dead':da,'dead_key':dk,'dead_step':ds,
+            'ab_closed':float(states[0]['AB_len']),'ab_open':float(states[-1]['AB_len']),
+            'stroke':float(states[-1]['AB_len']-states[0]['AB_len']),
+            'rod_rear_min':min(float(s['rod_rear_len']) for s in states),
+            'height_pass': True if base_open_z is None else float(fo[1]) >= float(base_open_z)-1e-9}
+
+def optimize_case(case: LinkageCase) -> Dict[str,Any]:
+    settings = case.settings
+    base_pts = case.copy_points()
+    base = evaluate(base_pts,settings)
+    if not base.get('ok'):
+        raise RuntimeError('原方案无法求解：'+base.get('message',''))
+    bounds = case.bounds()
+    variables = case.variables()
+    if not bounds:
+        return {'baseline':base,'optimized':base,'optimized_points':base_pts,'variables':[], 'vector':[], 'message':'未启用优化变量，返回原方案'}
+    history = []
+    def target_value(r):
+        if settings.target_mode == 'height': return r['dz']
+        if settings.target_mode == 'combined': return r['dx'] + r['dz']
+        return r['dx']
+    def obj(x):
+        pts = case.apply(x)
+        r = evaluate(pts,settings,base_open_z=base['f_open'][1])
+        if not r.get('ok'):
+            return 1e9
+        penalty = 0.0
+        if r['min_hole'] < settings.min_hole_distance:
+            penalty += 100000.0*(settings.min_hole_distance-r['min_hole']+1.0)**2
+        if settings.strict_dead_angle and r['min_dead'] < settings.min_dead_angle:
+            penalty += 100000.0*(settings.min_dead_angle-r['min_dead']+1.0)**2
+        if settings.height_not_lower and r['f_open'][1] < base['f_open'][1]:
+            penalty += 100000.0*(base['f_open'][1]-r['f_open'][1]+1.0)**2
+        if r['rod_rear_min'] < 0:
+            penalty += 100000.0*(abs(r['rod_rear_min'])+1.0)**2
+        val = target_value(r)
+        history.append({'x':[float(v) for v in x], 'value':float(val),'penalty':float(penalty), 'dx':r['dx'], 'dz':r['dz'], 'min_dead':r['min_dead'], 'min_hole':r['min_hole']})
+        return -val + penalty
+    opt = differential_evolution(obj,bounds,seed=42,maxiter=max(1,int(settings.maxiter)),popsize=max(3,int(settings.popsize)),tol=0.01,polish=False,updating='immediate',workers=1)
+    opt_pts = case.apply(opt.x)
+    opt_eval = evaluate(opt_pts,settings,base_open_z=base['f_open'][1])
+    return {'baseline':base,'optimized':opt_eval,'optimized_points':opt_pts,'variables':variables,'vector':[float(v) for v in opt.x],'message':'优化完成','history':history[-200:]}

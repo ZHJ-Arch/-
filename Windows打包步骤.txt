@@ -1,0 +1,188 @@
+import os, sys
+import numpy as np
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QGridLayout,QTableWidget,QTableWidgetItem,
+    QHeaderView,QPushButton,QLabel,QDoubleSpinBox,QSpinBox,QComboBox,QCheckBox,QTextEdit,QGroupBox,QSplitter,QMessageBox,QSlider)
+
+from linkage_core import POINTS, DRAW_LINKS, PointRange, Settings, LinkageCase, load_case, optimize_case
+
+
+def base_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+class LinkageView(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.base_states = None
+        self.opt_states = None
+        self.step = 0
+        self.setMinimumHeight(420)
+
+    def set_states(self, base, opt=None):
+        self.base_states = base
+        self.opt_states = opt
+        self.step = 0
+        self.update()
+
+    def set_step(self, step):
+        self.step = int(step)
+        self.update()
+
+    def all_pts(self):
+        pts=[]
+        for states in (self.base_states,self.opt_states):
+            if not states: continue
+            for st in states:
+                for p in 'ABCDEFGHIJ':
+                    if p in st: pts.append(st[p])
+        return pts
+
+    def transform(self):
+        pts=self.all_pts()
+        if not pts: return lambda p:(0,0)
+        xs=[float(p[0]) for p in pts]; zs=[float(p[1]) for p in pts]
+        minx,maxx,minz,maxz=min(xs)-40,max(xs)+40,min(zs)-40,max(zs)+40
+        w,h=max(1,self.width()-30),max(1,self.height()-30)
+        s=min(w/max(1e-9,maxx-minx), h/max(1e-9,maxz-minz))
+        ox=15-minx*s+(w-(maxx-minx)*s)/2
+        oy=15+maxz*s+(h-(maxz-minz)*s)/2
+        return lambda p:(float(p[0])*s+ox, oy-float(p[1])*s)
+
+    def draw_state(self,painter,st,color,dashed=False):
+        tr=self.transform()
+        pen=QPen(color,2)
+        if dashed: pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        for a,b in DRAW_LINKS:
+            if a in st and b in st:
+                x1,y1=tr(st[a]); x2,y2=tr(st[b]); painter.drawLine(int(x1),int(y1),int(x2),int(y2))
+        painter.setPen(QPen(color,1)); painter.setBrush(QBrush(color))
+        for p in 'ABCDEFGHIJ':
+            if p not in st: continue
+            x,y=tr(st[p]); painter.drawEllipse(int(x)-3,int(y)-3,6,6); painter.drawText(int(x)+5,int(y)-5,p)
+
+    def paintEvent(self,event):
+        painter=QPainter(self); painter.setRenderHint(QPainter.Antialiasing, True); painter.fillRect(self.rect(), QColor(250,250,250)); painter.setFont(QFont('Microsoft YaHei',9))
+        if not self.base_states:
+            painter.setPen(QColor(80,80,80)); painter.drawText(self.rect(), Qt.AlignCenter, '输入点位后点击“运行优化”显示连杆动画'); return
+        i=max(0,min(self.step,len(self.base_states)-1))
+        self.draw_state(painter,self.base_states[i],QColor(120,120,120),True)
+        if self.opt_states:
+            j=max(0,min(self.step,len(self.opt_states)-1)); self.draw_state(painter,self.opt_states[j],QColor(20,80,160),False)
+        painter.setPen(QColor(40,40,40)); painter.drawText(12,22,f"当前角度：{self.base_states[i].get('angle_deg',0):.1f}°    灰色虚线：优化前    蓝色实线：优化后")
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Legrest Linkage Optimizer - PySide6 原型')
+        self.resize(1380,820)
+        self.case = load_case(os.path.join(base_dir(),'data','default_case.json'))
+        self.result = None
+        self.timer = QTimer(); self.timer.timeout.connect(self.play_next)
+        self.build_ui(); self.load_case_to_ui()
+        self.summary.setText('已加载默认样例。手动调整点位、范围和目标后，点击“运行优化”。')
+
+    def build_ui(self):
+        central=QWidget(); self.setCentralWidget(central); root=QVBoxLayout(central); sp=QSplitter(Qt.Horizontal); root.addWidget(sp)
+        left=QWidget(); ll=QVBoxLayout(left); sp.addWidget(left)
+        right=QWidget(); rl=QVBoxLayout(right); sp.addWidget(right); sp.setSizes([520,860])
+
+        g=QGroupBox('1. 关闭状态点位坐标，单位 mm'); gl=QVBoxLayout(g); self.point_table=QTableWidget(len(POINTS),3); self.point_table.setHorizontalHeaderLabels(['点位','X','Z']); self.point_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for r,p in enumerate(POINTS):
+            it=QTableWidgetItem(p); it.setFlags(it.flags() & ~Qt.ItemIsEditable); self.point_table.setItem(r,0,it)
+        gl.addWidget(self.point_table); ll.addWidget(g)
+
+        g=QGroupBox('2. 可修改点与修改范围'); gl=QVBoxLayout(g); self.range_table=QTableWidget(len(POINTS),6); self.range_table.setHorizontalHeaderLabels(['点位','启用','X最小','X最大','Z最小','Z最大']); self.range_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for r,p in enumerate(POINTS):
+            it=QTableWidgetItem(p); it.setFlags(it.flags() & ~Qt.ItemIsEditable); self.range_table.setItem(r,0,it)
+            ck=QTableWidgetItem(); ck.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled); ck.setCheckState(Qt.Unchecked); self.range_table.setItem(r,1,ck)
+        gl.addWidget(self.range_table); ll.addWidget(g)
+
+        g=QGroupBox('3. 目标与约束'); grid=QGridLayout(g)
+        self.angle=QDoubleSpinBox(); self.angle.setRange(-180,180); self.angle.setDecimals(2); self.angle.setSuffix(' °')
+        self.rod=QDoubleSpinBox(); self.rod.setRange(0,500); self.rod.setDecimals(2); self.rod.setSuffix(' mm')
+        self.hole=QDoubleSpinBox(); self.hole.setRange(0,500); self.hole.setDecimals(2); self.hole.setSuffix(' mm')
+        self.dead=QDoubleSpinBox(); self.dead.setRange(0,90); self.dead.setDecimals(2); self.dead.setSuffix(' °')
+        self.target=QComboBox(); self.target.addItem('长度优先：F点向前位移最大','length'); self.target.addItem('高度优先：F点向上位移最大','height'); self.target.addItem('综合优先：ΔX + ΔZ 最大','combined')
+        self.height_check=QCheckBox('优化后F点打开高度不低于原方案'); self.dead_check=QCheckBox('死点角低于限制时作为硬约束')
+        self.steps=QSpinBox(); self.steps.setRange(5,80); self.iters=QSpinBox(); self.iters.setRange(1,200); self.pop=QSpinBox(); self.pop.setRange(3,30)
+        for row,items in enumerate([(QLabel('F-G打开角度'),self.angle,QLabel('A点后方丝杆长度'),self.rod),(QLabel('最小孔距'),self.hole,QLabel('最小死点角'),self.dead)]):
+            for col,w in enumerate(items): grid.addWidget(w,row,col)
+        grid.addWidget(QLabel('优化目标'),2,0); grid.addWidget(self.target,2,1,1,3); grid.addWidget(self.height_check,3,0,1,2); grid.addWidget(self.dead_check,3,2,1,2)
+        grid.addWidget(QLabel('动画步数'),4,0); grid.addWidget(self.steps,4,1); grid.addWidget(QLabel('优化迭代'),4,2); grid.addWidget(self.iters,4,3); grid.addWidget(QLabel('种群规模'),5,0); grid.addWidget(self.pop,5,1)
+        ll.addWidget(g)
+
+        row=QHBoxLayout(); self.btn_default=QPushButton('恢复默认样例'); self.btn_run=QPushButton('运行优化'); self.btn_play=QPushButton('播放动画'); self.btn_copy=QPushButton('复制优化后坐标')
+        row.addWidget(self.btn_default); row.addWidget(self.btn_run); row.addWidget(self.btn_play); row.addWidget(self.btn_copy); ll.addLayout(row)
+        self.btn_default.clicked.connect(self.reload_default); self.btn_run.clicked.connect(self.run_opt); self.btn_play.clicked.connect(self.toggle_play); self.btn_copy.clicked.connect(self.copy_result)
+
+        self.view=LinkageView(); rl.addWidget(self.view)
+        sr=QHBoxLayout(); self.slider=QSlider(Qt.Horizontal); self.slider.valueChanged.connect(self.view.set_step); sr.addWidget(QLabel('动画进度')); sr.addWidget(self.slider); rl.addLayout(sr)
+        self.summary=QTextEdit(); self.summary.setReadOnly(True); self.summary.setMinimumHeight(120); rl.addWidget(self.summary)
+        g=QGroupBox('优化后所有点坐标'); gl=QVBoxLayout(g); self.result_table=QTableWidget(len(POINTS),6); self.result_table.setHorizontalHeaderLabels(['点位','优化前X','优化前Z','优化后X','优化后Z','变化量']); self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); gl.addWidget(self.result_table); rl.addWidget(g)
+
+    def load_case_to_ui(self):
+        for r,p in enumerate(POINTS):
+            pt=self.case.points[p]
+            self.point_table.setItem(r,1,QTableWidgetItem(f'{pt[0]:.3f}')); self.point_table.setItem(r,2,QTableWidgetItem(f'{pt[1]:.3f}'))
+            rg=self.case.ranges.get(p,PointRange())
+            self.range_table.item(r,1).setCheckState(Qt.Checked if rg.enabled else Qt.Unchecked)
+            for c,v in enumerate([rg.x_min,rg.x_max,rg.z_min,rg.z_max],start=2): self.range_table.setItem(r,c,QTableWidgetItem(f'{v:.3f}'))
+        s=self.case.settings; self.angle.setValue(s.output_angle_deg); self.rod.setValue(s.rod_rear_length); self.hole.setValue(s.min_hole_distance); self.dead.setValue(s.min_dead_angle); self.steps.setValue(s.angle_steps); self.iters.setValue(s.maxiter); self.pop.setValue(s.popsize); self.height_check.setChecked(s.height_not_lower); self.dead_check.setChecked(s.strict_dead_angle); idx=self.target.findData(s.target_mode); self.target.setCurrentIndex(max(0,idx))
+
+    def read_case(self):
+        pts={}; ranges={}
+        for r,p in enumerate(POINTS):
+            pts[p]=np.array([float(self.point_table.item(r,1).text()),float(self.point_table.item(r,2).text())],dtype=float)
+            enabled=self.range_table.item(r,1).checkState()==Qt.Checked
+            vals=[float(self.range_table.item(r,c).text()) for c in range(2,6)]
+            if vals[0]>vals[1] or vals[2]>vals[3]: raise ValueError(f'{p}点修改范围下限大于上限')
+            ranges[p]=PointRange(enabled,vals[0],vals[1],vals[2],vals[3])
+        settings=Settings(float(self.angle.value()),float(self.rod.value()),float(self.hole.value()),float(self.dead.value()),int(self.steps.value()),int(self.iters.value()),int(self.pop.value()),str(self.target.currentData()),bool(self.height_check.isChecked()),bool(self.dead_check.isChecked()))
+        return LinkageCase(pts,ranges,settings)
+
+    def reload_default(self):
+        self.case=load_case(os.path.join(base_dir(),'data','default_case.json')); self.load_case_to_ui(); self.result=None; self.view.set_states(None,None); self.summary.setText('已恢复默认样例。')
+
+    def run_opt(self):
+        try:
+            self.case=self.read_case(); self.summary.setText('正在计算，请稍等。当前原型未做后台线程，计算期间界面会短暂无响应。'); QApplication.processEvents()
+            self.result=optimize_case(self.case); b=self.result['baseline']; o=self.result['optimized']; pts=self.result['optimized_points']; self.view.set_states(b['states'],o['states']); self.slider.setMaximum(len(b['states'])-1); self.slider.setValue(0); self.fill_result(pts); self.fill_summary()
+        except Exception as e:
+            QMessageBox.critical(self,'计算失败',str(e)); self.summary.setText('计算失败：'+str(e))
+
+    def fill_result(self,pts):
+        for r,p in enumerate(POINTS):
+            b,o=self.case.points[p],pts[p]
+            vals=[p,f'{b[0]:.3f}',f'{b[1]:.3f}',f'{o[0]:.3f}',f'{o[1]:.3f}',f'ΔX={o[0]-b[0]:.3f}, ΔZ={o[1]-b[1]:.3f}']
+            for c,v in enumerate(vals): self.result_table.setItem(r,c,QTableWidgetItem(v))
+
+    def fill_summary(self):
+        b=self.result['baseline']; o=self.result['optimized']
+        lines=['优化完成。',f"原方案 F点 ΔX={b['dx']:.3f} mm，ΔZ={b['dz']:.3f} mm",f"优化后 F点 ΔX={o['dx']:.3f} mm，ΔZ={o['dz']:.3f} mm",f"ΔX改善量={o['dx']-b['dx']:.3f} mm，ΔZ变化={o['dz']-b['dz']:.3f} mm",f"最小孔距={o['min_hole']:.3f} mm，位置={o['min_hole_key']}",f"最小死点角={o['min_dead']:.3f}°，位置={o['dead_key']}，step={o['dead_step']}",f"AB关闭有效长度={o['ab_closed']:.3f} mm，AB打开有效长度={o['ab_open']:.3f} mm，所需行程={o['stroke']:.3f} mm",f"运动过程中丝杆A点后方最小剩余长度={o['rod_rear_min']:.3f} mm",'说明：A为丝杆经过点，软件显示J-A-B；关闭状态A点后方长度默认70mm，可在界面修改。']
+        self.summary.setText('\n'.join(lines))
+
+    def toggle_play(self):
+        if not self.result: return
+        if self.timer.isActive(): self.timer.stop(); self.btn_play.setText('播放动画')
+        else: self.timer.start(120); self.btn_play.setText('暂停动画')
+
+    def play_next(self):
+        v=self.slider.value()+1
+        if v>self.slider.maximum(): v=0
+        self.slider.setValue(v)
+
+    def copy_result(self):
+        if not self.result:
+            QMessageBox.information(self,'提示','还没有优化结果。'); return
+        rows=['Point\tBase_X\tBase_Z\tOpt_X\tOpt_Z\tDelta_X\tDelta_Z']
+        pts=self.result['optimized_points']
+        for p in POINTS:
+            b,o=self.case.points[p],pts[p]
+            rows.append(f'{p}\t{b[0]:.3f}\t{b[1]:.3f}\t{o[0]:.3f}\t{o[1]:.3f}\t{o[0]-b[0]:.3f}\t{o[1]-b[1]:.3f}')
+        QApplication.clipboard().setText('\n'.join(rows)); QMessageBox.information(self,'已复制','优化后坐标已复制到剪贴板，可直接粘贴到Excel。')
+
+def main():
+    app=QApplication(sys.argv); app.setApplicationName('Legrest Linkage Optimizer'); win=MainWindow(); win.show(); sys.exit(app.exec())
+if __name__ == '__main__': main()

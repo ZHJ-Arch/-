@@ -1,0 +1,39 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build folder version
+        shell: cmd
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name LegrestOptimizer --add-data "data;data" main.py
+
+      - name: Package portable folder
+        shell: powershell
+        run: |
+          Compress-Archive -Path dist\LegrestOptimizer -DestinationPath LegrestOptimizer_Windows_Portable.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LegrestOptimizer_Windows_Portable
+          path: LegrestOptimizer_Windows_Portable.zip
