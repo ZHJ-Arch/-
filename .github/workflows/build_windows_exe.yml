@@ -25,7 +25,7 @@ jobs:
       - name: Build folder version
         shell: cmd
         run: |
-          pyinstaller --noconfirm --clean --windowed --name LegrestOptimizer --add-data "data;data" main.py
+          pyinstaller --noconfirm --clean --windowed --name LegrestOptimizer --add-data "default_case.json;." main.py
 
       - name: Package portable folder
         shell: powershell
