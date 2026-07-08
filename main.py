@@ -1,16 +1,22 @@
-import sys, math
+import sys, os, math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 from scipy.optimize import least_squares, differential_evolution
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont
+from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QPushButton,
     QTextEdit, QMessageBox, QSlider, QDoubleSpinBox, QSpinBox, QComboBox,
-    QCheckBox, QSplitter
+    QCheckBox, QSplitter, QScrollArea
+
 )
+
+def resource_path(relative_path: str) -> str:
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 POINT_ORDER = list('ABCDEFGHI')
 DEFAULT_POINTS = {
@@ -43,9 +49,12 @@ class Settings:
     min_hole_distance: float = 40.0
     min_dead_angle: float = 15.0
     angle_steps: int = 25
-    maxiter: int = 18
-    popsize: int = 7
+    maxiter: int = 10
+    popsize: int = 5
     target_mode: str = 'length'
+    # 前向方向：+1 表示 X+ 为前，-1 表示 X- 为前。
+    # 当前腿托示意中，F 点向左/小 X 通常才是前伸，所以默认 -1。
+    x_forward_sign: float = -1.0
     height_not_lower: bool = True
     strict_dead_angle: bool = True
 
@@ -162,9 +171,14 @@ def optimize_case(points, ranges, settings):
         return {'baseline':base,'optimized':base,'optimized_points':points,'variables':[],'vector':[],'candidates':[],'message':'未启用优化变量。'}
     candidates=[]
     def val(res):
-        if settings.target_mode == 'height': return res['dz']
-        if settings.target_mode == 'combined': return res['dx']+res['dz']
-        return res['dx']
+        # length 优先按“前向位移”判断，不再固定认为 +X 就是前。
+        # forward_dx = +dx 表示 X+ 为前；forward_dx = -dx 表示 X- 为前。
+        forward_dx = settings.x_forward_sign * res['dx']
+        if settings.target_mode == 'height':
+            return res['dz']
+        if settings.target_mode == 'combined':
+            return forward_dx + res['dz']
+        return forward_dx
     def obj(x):
         pts = apply_vector(points, ranges, x)
         res = evaluate(pts, settings, baseline_open_z=base['f_open'][1])
@@ -175,12 +189,28 @@ def optimize_case(points, ranges, settings):
         if settings.height_not_lower and res['f_open'][1] < base['f_open'][1]: pen += 100000.0*(base['f_open'][1]-res['f_open'][1]+1.0)**2
         if res['rod_rear_min'] < 0: pen += 100000.0*(abs(res['rod_rear_min'])+1.0)**2
         tv = val(res)
-        candidates.append({'x':[float(v) for v in x],'target':float(tv),'dx':float(res['dx']),'dz':float(res['dz']),'min_dead':float(res['min_dead']),'min_hole':float(res['min_hole']),'penalty':float(pen)})
+        candidates.append({'x':[float(v) for v in x],'target':float(tv),'dx':float(res['dx']),'dz':float(res['dz']),'forward_dx':float(settings.x_forward_sign*res['dx']),'min_dead':float(res['min_dead']),'min_hole':float(res['min_hole']),'penalty':float(pen)})
         return -tv + pen
     opt = differential_evolution(obj, bounds=bounds, seed=42, maxiter=max(1,int(settings.maxiter)), popsize=max(3,int(settings.popsize)), tol=0.01, polish=False, updating='immediate', workers=1)
     opt_pts = apply_vector(points, ranges, opt.x)
     opt_eval = evaluate(opt_pts, settings, baseline_open_z=base['f_open'][1])
     return {'baseline':base,'optimized':opt_eval,'optimized_points':opt_pts,'variables':variables,'vector':[float(v) for v in opt.x],'candidates':candidates,'message':'优化完成。'}
+
+
+class ReferenceImageLabel(QLabel):
+    def __init__(self,parent=None):
+        super().__init__(parent); self._pixmap_original=None; self.setAlignment(Qt.AlignCenter); self.setMinimumHeight(260); self.setStyleSheet('QLabel { background-color: #f7f7f7; border: 1px solid #cccccc; }')
+    def set_image(self,path):
+        pixmap=QPixmap(path)
+        if pixmap.isNull():
+            self._pixmap_original=None; self.setText('示意图加载失败：图片文件损坏'); return
+        self._pixmap_original=pixmap; self._update_scaled()
+    def resizeEvent(self,event):
+        super().resizeEvent(event); self._update_scaled()
+    def _update_scaled(self):
+        if self._pixmap_original is None: return
+        scaled=self._pixmap_original.scaled(max(1,self.width()-10), max(1,self.height()-10), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.setPixmap(scaled)
 
 class LinkageView(QWidget):
     def __init__(self,parent=None):
@@ -225,19 +255,33 @@ class LinkageView(QWidget):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle('Legrest Linkage Optimizer - 连杆优化桌面原型'); self.resize(1400,840)
+        super().__init__(); self.setWindowTitle('Legrest Linkage Optimizer - 连杆优化桌面原型'); self.resize(1480,900)
         self.points={k:v.copy() for k,v in DEFAULT_POINTS.items()}; self.ranges=self.default_ranges(); self.settings=Settings(); self.result=None
         central=QWidget(); self.setCentralWidget(central); main=QVBoxLayout(central); spl=QSplitter(Qt.Horizontal); main.addWidget(spl)
-        left=QWidget(); ll=QVBoxLayout(left); spl.addWidget(left); right=QWidget(); rl=QVBoxLayout(right); spl.addWidget(right); spl.setSizes([520,880])
-        self.build_point_table(ll); self.build_range_table(ll); self.build_settings(ll); self.build_buttons(ll)
+        left_content=QWidget(); ll=QVBoxLayout(left_content); ll.setContentsMargins(8,8,8,8)
+        left_scroll=QScrollArea(); left_scroll.setWidgetResizable(True); left_scroll.setWidget(left_content); spl.addWidget(left_scroll)
+        right=QWidget(); rl=QVBoxLayout(right); spl.addWidget(right); spl.setSizes([560,920])
+        self.build_reference_image(ll); self.build_point_table(ll); self.build_range_table(ll); self.build_settings(ll); self.build_buttons(ll); ll.addStretch(1)
         self.view=LinkageView(); rl.addWidget(self.view)
         row=QHBoxLayout(); self.step_slider=QSlider(Qt.Horizontal); self.step_slider.setMinimum(0); self.step_slider.setMaximum(self.settings.angle_steps); self.step_slider.valueChanged.connect(self.on_slider); row.addWidget(QLabel('动画进度')); row.addWidget(self.step_slider); rl.addLayout(row)
         self.summary=QTextEdit(); self.summary.setReadOnly(True); self.summary.setMinimumHeight(130); rl.addWidget(self.summary); self.build_result_table(rl)
-        self.timer=QTimer(); self.timer.timeout.connect(self.play_next); self.load_to_ui(); self.summary.setText('已加载默认样例。流程：输入 A-I 点坐标 → 选择可优化点和范围 → 设置目标和约束 → 点击“运行优化”。\n说明：A 为丝杆经过点，软件按 J-A-B 显示丝杆；默认 A 点后方丝杆长度 70mm。')
+        self.timer=QTimer(); self.timer.timeout.connect(self.play_next); self.load_to_ui(); self.summary.setText('已加载默认样例。流程：参考左侧点位示意图 → 输入 A-I 点坐标 → 选择可优化点和范围 → 设置目标和约束 → 点击“运行优化”。\n说明：A 为丝杆经过点，软件按 J-A-B 显示丝杆；默认 A 点后方丝杆长度 70mm；默认前向方向为 X-，即 F 点向左/小 X 为前伸。')
     def default_ranges(self):
         r={p:PointRange(False,0,0,0,0) for p in POINT_ORDER}
         r['D']=PointRange(True,0,0,-2,2); r['E']=PointRange(True,-1,1,0,2); r['G']=PointRange(True,-1,1,-1,1); r['I']=PointRange(True,-1,1,0,2)
         return r
+
+    def build_reference_image(self,layout):
+        g=QGroupBox('0. 点位示意图 / 机构说明'); l=QVBoxLayout(g)
+        tip=QLabel('请参考下图理解 A、B、C、D、E、F、G、H、I 各点在腿托机构上的对应位置。图中 F 点为输出点，F-G 为输出连杆。')
+        tip.setWordWrap(True); l.addWidget(tip)
+        self.reference_image_label=ReferenceImageLabel()
+        image_path=resource_path('resources/linkage_points_guide.png')
+        if os.path.exists(image_path):
+            self.reference_image_label.set_image(image_path)
+        else:
+            self.reference_image_label.setText('未找到点位示意图。\n请确认 resources/linkage_points_guide.png 已放入项目中。')
+        l.addWidget(self.reference_image_label); layout.addWidget(g)
     def build_point_table(self,layout):
         g=QGroupBox('1. 关闭状态 A-I 点位坐标，单位 mm'); l=QVBoxLayout(g); self.point_table=QTableWidget(len(POINT_ORDER),3); self.point_table.setHorizontalHeaderLabels(['点位','X','Z']); self.point_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for row,p in enumerate(POINT_ORDER):
@@ -255,16 +299,19 @@ class MainWindow(QMainWindow):
         self.rod_spin=QDoubleSpinBox(); self.rod_spin.setRange(0,500); self.rod_spin.setDecimals(2); self.rod_spin.setValue(70); self.rod_spin.setSuffix(' mm')
         self.hole_spin=QDoubleSpinBox(); self.hole_spin.setRange(0,500); self.hole_spin.setDecimals(2); self.hole_spin.setValue(40); self.hole_spin.setSuffix(' mm')
         self.dead_spin=QDoubleSpinBox(); self.dead_spin.setRange(0,90); self.dead_spin.setDecimals(2); self.dead_spin.setValue(15); self.dead_spin.setSuffix(' °')
-        self.target_combo=QComboBox(); self.target_combo.addItem('长度优先：F点向前位移最大','length'); self.target_combo.addItem('高度优先：F点向上位移最大','height'); self.target_combo.addItem('综合优先：ΔX + ΔZ 最大','combined')
+        self.target_combo=QComboBox(); self.target_combo.addItem('长度优先：F点向前位移最大','length'); self.target_combo.addItem('高度优先：F点向上位移最大','height'); self.target_combo.addItem('综合优先：前向位移 + ΔZ 最大','combined')
+        self.forward_combo=QComboBox(); self.forward_combo.addItem('X- 向前（F点向左/小X为前）', -1.0); self.forward_combo.addItem('X+ 向前（大X为前）', 1.0)
         self.height_check=QCheckBox('优化后 F 点打开高度不低于原方案'); self.height_check.setChecked(True)
         self.strict_dead_check=QCheckBox('死点角低于限制时作为硬约束'); self.strict_dead_check.setChecked(True)
         self.step_spin=QSpinBox(); self.step_spin.setRange(5,80); self.step_spin.setValue(25)
-        self.maxiter_spin=QSpinBox(); self.maxiter_spin.setRange(1,100); self.maxiter_spin.setValue(18)
-        self.popsize_spin=QSpinBox(); self.popsize_spin.setRange(3,30); self.popsize_spin.setValue(7)
+        self.maxiter_spin=QSpinBox(); self.maxiter_spin.setRange(1,100); self.maxiter_spin.setValue(10)
+        self.popsize_spin=QSpinBox(); self.popsize_spin.setRange(3,30); self.popsize_spin.setValue(5)
         grid.addWidget(QLabel('F-G打开角度'),0,0); grid.addWidget(self.angle_spin,0,1); grid.addWidget(QLabel('A点后方丝杆长度'),0,2); grid.addWidget(self.rod_spin,0,3)
         grid.addWidget(QLabel('最小孔距'),1,0); grid.addWidget(self.hole_spin,1,1); grid.addWidget(QLabel('最小死点角'),1,2); grid.addWidget(self.dead_spin,1,3)
-        grid.addWidget(QLabel('优化目标'),2,0); grid.addWidget(self.target_combo,2,1,1,3); grid.addWidget(self.height_check,3,0,1,2); grid.addWidget(self.strict_dead_check,3,2,1,2)
-        grid.addWidget(QLabel('动画步数'),4,0); grid.addWidget(self.step_spin,4,1); grid.addWidget(QLabel('优化迭代'),4,2); grid.addWidget(self.maxiter_spin,4,3); grid.addWidget(QLabel('种群规模'),5,0); grid.addWidget(self.popsize_spin,5,1)
+        grid.addWidget(QLabel('优化目标'),2,0); grid.addWidget(self.target_combo,2,1,1,3)
+        grid.addWidget(QLabel('前向方向'),3,0); grid.addWidget(self.forward_combo,3,1,1,3)
+        grid.addWidget(self.height_check,4,0,1,2); grid.addWidget(self.strict_dead_check,4,2,1,2)
+        grid.addWidget(QLabel('动画步数'),5,0); grid.addWidget(self.step_spin,5,1); grid.addWidget(QLabel('优化迭代'),5,2); grid.addWidget(self.maxiter_spin,5,3); grid.addWidget(QLabel('种群规模'),6,0); grid.addWidget(self.popsize_spin,6,1)
         layout.addWidget(g)
     def build_buttons(self,layout):
         row=QHBoxLayout(); self.btn_default=QPushButton('恢复默认样例'); self.btn_run=QPushButton('运行优化'); self.btn_play=QPushButton('播放动画'); self.btn_copy=QPushButton('复制优化后坐标')
@@ -279,6 +326,9 @@ class MainWindow(QMainWindow):
             rg=self.ranges[p]; self.range_table.item(row,1).setCheckState(Qt.Checked if rg.enabled else Qt.Unchecked)
             for col,val in enumerate([rg.x_min,rg.x_max,rg.z_min,rg.z_max],2): self.range_table.setItem(row,col,QTableWidgetItem(f'{val:.3f}'))
         self.angle_spin.setValue(self.settings.output_angle_deg); self.rod_spin.setValue(self.settings.rod_rear_length); self.hole_spin.setValue(self.settings.min_hole_distance); self.dead_spin.setValue(self.settings.min_dead_angle); self.step_spin.setValue(self.settings.angle_steps); self.maxiter_spin.setValue(self.settings.maxiter); self.popsize_spin.setValue(self.settings.popsize)
+        if hasattr(self, 'forward_combo'):
+            idx = self.forward_combo.findData(float(self.settings.x_forward_sign))
+            self.forward_combo.setCurrentIndex(idx if idx >= 0 else 0)
     def read_ui(self):
         pts={}; ranges={}
         for row,p in enumerate(POINT_ORDER):
@@ -290,7 +340,19 @@ class MainWindow(QMainWindow):
             except Exception: raise ValueError(f'{p} 点修改范围输入错误')
             if vals[0]>vals[1] or vals[2]>vals[3]: raise ValueError(f'{p} 点修改范围下限大于上限')
             ranges[p]=PointRange(en,vals[0],vals[1],vals[2],vals[3])
-        st=Settings(float(self.angle_spin.value()), float(self.rod_spin.value()), float(self.hole_spin.value()), float(self.dead_spin.value()), int(self.step_spin.value()), int(self.maxiter_spin.value()), int(self.popsize_spin.value()), str(self.target_combo.currentData()), bool(self.height_check.isChecked()), bool(self.strict_dead_check.isChecked()))
+        st=Settings(
+            output_angle_deg=float(self.angle_spin.value()),
+            rod_rear_length=float(self.rod_spin.value()),
+            min_hole_distance=float(self.hole_spin.value()),
+            min_dead_angle=float(self.dead_spin.value()),
+            angle_steps=int(self.step_spin.value()),
+            maxiter=int(self.maxiter_spin.value()),
+            popsize=int(self.popsize_spin.value()),
+            target_mode=str(self.target_combo.currentData()),
+            x_forward_sign=float(self.forward_combo.currentData()),
+            height_not_lower=bool(self.height_check.isChecked()),
+            strict_dead_angle=bool(self.strict_dead_check.isChecked())
+        )
         return pts,ranges,st
     def reload_default(self):
         self.points={k:v.copy() for k,v in DEFAULT_POINTS.items()}; self.ranges=self.default_ranges(); self.settings=Settings(); self.result=None; self.load_to_ui(); self.view.set_states(None,None); self.summary.setText('已恢复默认样例。'); self.result_table.clearContents()
@@ -307,11 +369,30 @@ class MainWindow(QMainWindow):
             for c,v in enumerate(vals): self.result_table.setItem(row,c,QTableWidgetItem(v))
     def fill_summary(self):
         base,opt=self.result['baseline'],self.result['optimized']; lines=[]
-        lines += ['优化完成。','',f"原方案 F点 ΔX={base['dx']:.3f} mm，ΔZ={base['dz']:.3f} mm",f"优化后 F点 ΔX={opt['dx']:.3f} mm，ΔZ={opt['dz']:.3f} mm",f"ΔX改善量={opt['dx']-base['dx']:.3f} mm，ΔZ变化={opt['dz']-base['dz']:.3f} mm",'',f"最小孔距={opt['min_hole']:.3f} mm，位置={opt['min_hole_key']}，限制={self.settings.min_hole_distance:.1f} mm",f"最小死点角={opt['min_dead']:.3f}°，位置={opt['dead_key']}，step={opt['dead_step']}，限制={self.settings.min_dead_angle:.1f}°",'',f"AB关闭有效长度={opt['ab_closed']:.3f} mm",f"AB打开有效长度={opt['ab_open']:.3f} mm",f"所需丝杆行程={opt['stroke']:.3f} mm",f"运动过程中 A 点后方丝杆最小剩余长度={opt['rod_rear_min']:.3f} mm",'']
+        base_forward = self.settings.x_forward_sign * base['dx']
+        opt_forward = self.settings.x_forward_sign * opt['dx']
+        forward_text = 'X+ 向前' if self.settings.x_forward_sign > 0 else 'X- 向前'
+        lines += [
+            '优化完成。',
+            '',
+            f'当前前向方向：{forward_text}',
+            f"原方案 F点 原始ΔX={base['dx']:.3f} mm，前向位移={base_forward:.3f} mm，ΔZ={base['dz']:.3f} mm",
+            f"优化后 F点 原始ΔX={opt['dx']:.3f} mm，前向位移={opt_forward:.3f} mm，ΔZ={opt['dz']:.3f} mm",
+            f"前向改善量={opt_forward-base_forward:.3f} mm，原始ΔX变化={opt['dx']-base['dx']:.3f} mm，ΔZ变化={opt['dz']-base['dz']:.3f} mm",
+            '',
+            f"最小孔距={opt['min_hole']:.3f} mm，位置={opt['min_hole_key']}，限制={self.settings.min_hole_distance:.1f} mm",
+            f"最小死点角={opt['min_dead']:.3f}°，位置={opt['dead_key']}，step={opt['dead_step']}，限制={self.settings.min_dead_angle:.1f}°",
+            '',
+            f"AB关闭有效长度={opt['ab_closed']:.3f} mm",
+            f"AB打开有效长度={opt['ab_open']:.3f} mm",
+            f"所需丝杆行程={opt['stroke']:.3f} mm",
+            f"运动过程中 A 点后方丝杆最小剩余长度={opt['rod_rear_min']:.3f} mm",
+            ''
+        ]
         if self.result['variables']:
             lines.append('优化变量：')
             for (p,ax),v in zip(self.result['variables'], self.result['vector']): lines.append(f'  {p}_{ax} = {v:.4f} mm')
-        lines.append(''); lines.append('说明：A 为丝杆经过点，软件显示 J-A-B；关闭状态 A 点后方丝杆长度按界面输入值计算。')
+        lines.append(''); lines.append('说明：A 为丝杆经过点，软件显示 J-A-B；关闭状态 A 点后方丝杆长度按界面输入值计算；长度优先按“前向方向”计算，不再固定按 +X。')
         self.summary.setText('\n'.join(lines))
     def on_slider(self,value): self.view.set_step(value)
     def toggle_play(self):
@@ -333,4 +414,3 @@ def main():
     app=QApplication(sys.argv); app.setApplicationName('Legrest Linkage Optimizer'); win=MainWindow(); win.show(); sys.exit(app.exec())
 
 if __name__ == '__main__': main()
-
