@@ -49,8 +49,8 @@ class Settings:
     min_hole_distance: float = 40.0
     min_dead_angle: float = 15.0
     angle_steps: int = 25
-    maxiter: int = 10
-    popsize: int = 5
+    maxiter: int = 100
+    popsize: int = 30
     target_mode: str = 'length'
     # 前向方向：+1 表示 X+ 为前，-1 表示 X- 为前。
     # 当前腿托示意中，F 点向左/小 X 通常才是前伸，所以默认 -1。
@@ -166,6 +166,7 @@ def apply_vector(points, ranges, x):
 def optimize_case(points, ranges, settings):
     base = evaluate(points, settings)
     if not base.get('ok',False): raise RuntimeError('原始方案无法求解：'+base.get('message',''))
+    base_forward = float(settings.x_forward_sign * base['dx'])
     bounds = variable_bounds(ranges); variables = enabled_variables(ranges)
     if not bounds:
         return {'baseline':base,'optimized':base,'optimized_points':points,'variables':[],'vector':[],'candidates':[],'message':'未启用优化变量。'}
@@ -179,22 +180,70 @@ def optimize_case(points, ranges, settings):
         if settings.target_mode == 'combined':
             return forward_dx + res['dz']
         return forward_dx
+    def constraint_penalty(res):
+        pen = 0.0
+        if res['min_hole'] < settings.min_hole_distance:
+            pen += 100000.0*(settings.min_hole_distance-res['min_hole']+1.0)**2
+        if settings.strict_dead_angle and res['min_dead'] < settings.min_dead_angle:
+            pen += 100000.0*(settings.min_dead_angle-res['min_dead']+1.0)**2
+        if settings.height_not_lower and res['f_open'][1] < base['f_open'][1]:
+            pen += 100000.0*(base['f_open'][1]-res['f_open'][1]+1.0)**2
+        if res['rod_rear_min'] < 0:
+            pen += 100000.0*(abs(res['rod_rear_min'])+1.0)**2
+        return pen
+    def is_feasible(res):
+        if not res.get('ok', False):
+            return False
+        if res['min_hole'] < settings.min_hole_distance - 1e-9:
+            return False
+        if settings.strict_dead_angle and res['min_dead'] < settings.min_dead_angle - 1e-9:
+            return False
+        if settings.height_not_lower and res['f_open'][1] < base['f_open'][1] - 1e-9:
+            return False
+        if res['rod_rear_min'] < -1e-9:
+            return False
+        return True
+    def length_not_worse(res):
+        return float(settings.x_forward_sign * res['dx']) >= base_forward - 1e-9
     def obj(x):
         pts = apply_vector(points, ranges, x)
         res = evaluate(pts, settings, baseline_open_z=base['f_open'][1])
         if not res.get('ok',False): return 1e9
-        pen = 0.0
-        if res['min_hole'] < settings.min_hole_distance: pen += 100000.0*(settings.min_hole_distance-res['min_hole']+1.0)**2
-        if settings.strict_dead_angle and res['min_dead'] < settings.min_dead_angle: pen += 100000.0*(settings.min_dead_angle-res['min_dead']+1.0)**2
-        if settings.height_not_lower and res['f_open'][1] < base['f_open'][1]: pen += 100000.0*(base['f_open'][1]-res['f_open'][1]+1.0)**2
-        if res['rod_rear_min'] < 0: pen += 100000.0*(abs(res['rod_rear_min'])+1.0)**2
+        pen = constraint_penalty(res)
+        forward_dx = float(settings.x_forward_sign * res['dx'])
+        if settings.target_mode == 'length' and forward_dx < base_forward:
+            pen += 1000000.0*(base_forward-forward_dx+1.0)**2
         tv = val(res)
-        candidates.append({'x':[float(v) for v in x],'target':float(tv),'dx':float(res['dx']),'dz':float(res['dz']),'forward_dx':float(settings.x_forward_sign*res['dx']),'min_dead':float(res['min_dead']),'min_hole':float(res['min_hole']),'penalty':float(pen)})
+        candidates.append({'x':[float(v) for v in x],'target':float(tv),'dx':float(res['dx']),'dz':float(res['dz']),'forward_dx':forward_dx,'min_dead':float(res['min_dead']),'min_hole':float(res['min_hole']),'penalty':float(pen)})
         return -tv + pen
     opt = differential_evolution(obj, bounds=bounds, seed=42, maxiter=max(1,int(settings.maxiter)), popsize=max(3,int(settings.popsize)), tol=0.01, polish=False, updating='immediate', workers=1)
-    opt_pts = apply_vector(points, ranges, opt.x)
-    opt_eval = evaluate(opt_pts, settings, baseline_open_z=base['f_open'][1])
-    return {'baseline':base,'optimized':opt_eval,'optimized_points':opt_pts,'variables':variables,'vector':[float(v) for v in opt.x],'candidates':candidates,'message':'优化完成。'}
+    result_vectors = [np.array(opt.x, dtype=float)]
+    for cand in sorted(candidates, key=lambda c: (c['penalty'], -c['target']))[:80]:
+        result_vectors.append(np.array(cand['x'], dtype=float))
+
+    best_vector = None
+    best_points = points
+    best_eval = base
+    best_value = val(base)
+    for vector in result_vectors:
+        pts = apply_vector(points, ranges, vector)
+        res = evaluate(pts, settings, baseline_open_z=base['f_open'][1])
+        if not is_feasible(res):
+            continue
+        if settings.target_mode == 'length' and not length_not_worse(res):
+            continue
+        score = val(res)
+        if score > best_value + 1e-9:
+            best_value = score
+            best_vector = vector
+            best_points = pts
+            best_eval = res
+
+    if best_vector is None:
+        msg = '未找到满足约束且前向位移不低于原方案的更优解，已保留原方案。'
+        return {'baseline':base,'optimized':base,'optimized_points':points,'variables':variables,'vector':[0.0 for _ in variables],'candidates':candidates,'message':msg}
+
+    return {'baseline':base,'optimized':best_eval,'optimized_points':best_points,'variables':variables,'vector':[float(v) for v in best_vector],'candidates':candidates,'message':'优化完成。'}
 
 
 class ReferenceImageLabel(QLabel):
@@ -264,7 +313,7 @@ class MainWindow(QMainWindow):
         self.build_reference_image(ll); self.build_point_table(ll); self.build_range_table(ll); self.build_settings(ll); self.build_buttons(ll); ll.addStretch(1)
         self.view=LinkageView(); rl.addWidget(self.view)
         row=QHBoxLayout(); self.step_slider=QSlider(Qt.Horizontal); self.step_slider.setMinimum(0); self.step_slider.setMaximum(self.settings.angle_steps); self.step_slider.valueChanged.connect(self.on_slider); row.addWidget(QLabel('动画进度')); row.addWidget(self.step_slider); rl.addLayout(row)
-        self.summary=QTextEdit(); self.summary.setReadOnly(True); self.summary.setMinimumHeight(130); rl.addWidget(self.summary); self.build_result_table(rl)
+        self.summary=QTextEdit(); self.summary.setReadOnly(True); self.summary.setMinimumHeight(150); rl.addWidget(self.summary); self.build_result_table(rl)
         self.timer=QTimer(); self.timer.timeout.connect(self.play_next); self.load_to_ui(); self.summary.setText('已加载默认样例。流程：参考左侧点位示意图 → 输入 A-I 点坐标 → 选择可优化点和范围 → 设置目标和约束 → 点击“运行优化”。\n说明：A 为丝杆经过点，软件按 J-A-B 显示丝杆；默认 A 点后方丝杆长度 70mm；默认前向方向为 X-，即 F 点向左/小 X 为前伸。')
     def default_ranges(self):
         r={p:PointRange(False,0,0,0,0) for p in POINT_ORDER}
@@ -304,8 +353,8 @@ class MainWindow(QMainWindow):
         self.height_check=QCheckBox('优化后 F 点打开高度不低于原方案'); self.height_check.setChecked(True)
         self.strict_dead_check=QCheckBox('死点角低于限制时作为硬约束'); self.strict_dead_check.setChecked(True)
         self.step_spin=QSpinBox(); self.step_spin.setRange(5,80); self.step_spin.setValue(25)
-        self.maxiter_spin=QSpinBox(); self.maxiter_spin.setRange(1,100); self.maxiter_spin.setValue(10)
-        self.popsize_spin=QSpinBox(); self.popsize_spin.setRange(3,30); self.popsize_spin.setValue(5)
+        self.maxiter_spin=QSpinBox(); self.maxiter_spin.setRange(1,1000); self.maxiter_spin.setValue(100)
+        self.popsize_spin=QSpinBox(); self.popsize_spin.setRange(3,100); self.popsize_spin.setValue(30)
         grid.addWidget(QLabel('F-G打开角度'),0,0); grid.addWidget(self.angle_spin,0,1); grid.addWidget(QLabel('A点后方丝杆长度'),0,2); grid.addWidget(self.rod_spin,0,3)
         grid.addWidget(QLabel('最小孔距'),1,0); grid.addWidget(self.hole_spin,1,1); grid.addWidget(QLabel('最小死点角'),1,2); grid.addWidget(self.dead_spin,1,3)
         grid.addWidget(QLabel('优化目标'),2,0); grid.addWidget(self.target_combo,2,1,1,3)
@@ -373,7 +422,7 @@ class MainWindow(QMainWindow):
         opt_forward = self.settings.x_forward_sign * opt['dx']
         forward_text = 'X+ 向前' if self.settings.x_forward_sign > 0 else 'X- 向前'
         lines += [
-            '优化完成。',
+            self.result.get('message', '优化完成。'),
             '',
             f'当前前向方向：{forward_text}',
             f"原方案 F点 原始ΔX={base['dx']:.3f} mm，前向位移={base_forward:.3f} mm，ΔZ={base['dz']:.3f} mm",
