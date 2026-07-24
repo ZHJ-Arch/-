@@ -1,4 +1,4 @@
-import sys, os, math, csv, json
+import sys, os, math, csv, json, time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -14,13 +14,22 @@ from PySide6.QtWidgets import (
     QSplitter, QScrollArea, QFileDialog
 )
 
-APP_VERSION = "V1.3"
+APP_VERSION = "V1.31"
 
 
 def resource_path(relative_path: str) -> str:
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+    minutes = int(seconds // 60)
+    remain = seconds - minutes * 60
+    return f"{minutes} min {remain:.2f} s"
 
 
 POINT_ORDER = list("ABCDEFGHI")
@@ -401,11 +410,13 @@ class OptimizeWorker(QObject):
         self.settings = settings
 
     def run(self):
+        start_time = time.perf_counter()
         try:
             result = optimize_case(self.points, self.ranges, self.settings)
+            result["elapsed_seconds"] = time.perf_counter() - start_time
             self.result_ready.emit(result)
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(f"{str(exc)}\n本次计算用时：{format_elapsed(time.perf_counter() - start_time)}")
         finally:
             self.finished.emit()
 
@@ -608,7 +619,7 @@ class MainWindow(QMainWindow):
         self.load_to_ui()
         self.summary.setText(
             f"已加载默认样例（{APP_VERSION}）。\n"
-            "V1.3规则：长度优先默认F点向左，高度优先默认F点向上，综合优先要求不向右且不向下。\n"
+            "V1.31规则：长度优先默认F点向左，高度优先默认F点向上，综合优先要求不向右且不向下。\n"
             "死点角仅作为风险提示，不再作为默认硬约束。"
         )
 
@@ -1026,8 +1037,10 @@ class MainWindow(QMainWindow):
         target_text = {"length": "长度优先", "height": "高度优先", "combined": "综合优先"}.get(self.settings.target_mode, self.settings.target_mode)
         fallback = "是" if self.result.get("is_baseline_fallback", False) else "否"
         dead_status = "OK" if opt["min_dead"] >= self.settings.min_dead_angle else "Risk"
+        elapsed_text = format_elapsed(self.result.get("elapsed_seconds", 0.0))
         lines = [
-            self.result.get("message", "优化完成。"), "",
+            self.result.get("message", "优化完成。"),
+            f"本次计算用时：{elapsed_text}", "",
             f"目标模式：{target_text}",
             "方向规则：长度=F点打开后向左；高度=F点打开后向上。",
             f"是否回退原方案：{fallback}", "",
@@ -1037,7 +1050,7 @@ class MainWindow(QMainWindow):
             f"高度改善量(向上为正)={height_improve:.3f} mm", "",
             f"最小孔距={opt['min_hole']:.3f} mm，位置={opt['min_hole_key']}，限制={self.settings.min_hole_distance:.1f} mm",
             f"最小死点角={opt['min_dead']:.3f}°，位置={opt['dead_key']}，step={opt['dead_step']}，参考限制={self.settings.min_dead_angle:.1f}°，状态={dead_status}",
-            "说明：V1.3中死点角仅作为风险提示，不作为默认硬约束。", "",
+            "说明：V1.31中死点角仅作为风险提示，不作为默认硬约束。", "",
             f"AB关闭有效长度={opt['ab_closed']:.3f} mm",
             f"AB打开有效长度={opt['ab_open']:.3f} mm",
             f"所需丝杆行程={opt['stroke']:.3f} mm",
